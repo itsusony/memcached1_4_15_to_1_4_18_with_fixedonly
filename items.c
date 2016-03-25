@@ -345,6 +345,7 @@ void do_item_unlink_nolock(item *it, const uint32_t hv) {
 void do_item_remove(item *it) {
     MEMCACHED_ITEM_REMOVE(ITEM_key(it), it->nkey, it->nbytes);
     assert((it->it_flags & ITEM_SLABBED) == 0);
+    assert(it->refcount > 0);
 
     if (refcount_decr(&it->refcount) == 0) {
         item_free(it);
@@ -537,11 +538,15 @@ item *do_item_get(const char *key, const size_t nkey, const uint32_t hv) {
     int was_found = 0;
 
     if (settings.verbose > 2) {
+        int ii;
         if (it == NULL) {
-            fprintf(stderr, "> NOT FOUND %s", key);
+            fprintf(stderr, "> NOT FOUND ");
         } else {
-            fprintf(stderr, "> FOUND KEY %s", ITEM_key(it));
+            fprintf(stderr, "> FOUND KEY ");
             was_found++;
+        }
+        for (ii = 0; ii < nkey; ++ii) {
+            fprintf(stderr, "%c", key[ii]);
         }
     }
 

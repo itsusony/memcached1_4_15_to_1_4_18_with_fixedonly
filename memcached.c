@@ -442,6 +442,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->iovused = 0;
     c->msgcurr = 0;
     c->msgused = 0;
+    c->authenticated = false;
 
     c->write_and_go = init_state;
     c->write_and_free = 0;
@@ -754,10 +755,12 @@ static int build_udp_headers(conn *c) {
 
     if (c->msgused > c->hdrsize) {
         void *new_hdrbuf;
-        if (c->hdrbuf)
+        if (c->hdrbuf) {
             new_hdrbuf = realloc(c->hdrbuf, c->msgused * 2 * UDP_HEADER_SIZE);
-        else
+        } else {
             new_hdrbuf = malloc(c->msgused * 2 * UDP_HEADER_SIZE);
+        }
+
         if (! new_hdrbuf)
             return -1;
         c->hdrbuf = (unsigned char *)new_hdrbuf;
@@ -1086,12 +1089,16 @@ static void complete_incr_bin(conn *c) {
         if (req->message.body.expiration != 0xffffffff) {
             /* Save some room for the response */
             rsp->message.body.value = htonll(req->message.body.initial);
+
+            snprintf(tmpbuf, INCR_MAX_STORAGE_LEN, "%llu",
+                (unsigned long long)req->message.body.initial);
+            int res = strlen(tmpbuf);
             it = item_alloc(key, nkey, 0, realtime(req->message.body.expiration),
-                            INCR_MAX_STORAGE_LEN);
+                            res + 2);
 
             if (it != NULL) {
-                snprintf(ITEM_data(it), INCR_MAX_STORAGE_LEN, "%llu",
-                         (unsigned long long)req->message.body.initial);
+                memcpy(ITEM_data(it), tmpbuf, res);
+                memcpy(ITEM_data(it) + res, "\r\n", 2);
 
                 if (store_item(it, NREAD_ADD, c)) {
                     c->cas = ITEM_get_cas(it);
@@ -1191,26 +1198,33 @@ static void complete_update_bin(conn *c) {
     c->item = 0;
 }
 
-static void process_bin_touch(conn *c) {
+static void process_bin_get_or_touch(conn *c) {
     item *it;
 
     protocol_binary_response_get* rsp = (protocol_binary_response_get*)c->wbuf;
     char* key = binary_get_key(c);
     size_t nkey = c->binary_header.request.keylen;
-    protocol_binary_request_touch *t = binary_get_request(c);
-    time_t exptime = ntohl(t->message.body.expiration);
+    int should_touch = (c->cmd == PROTOCOL_BINARY_CMD_TOUCH ||
+                        c->cmd == PROTOCOL_BINARY_CMD_GAT ||
+                        c->cmd == PROTOCOL_BINARY_CMD_GATK);
+    int should_return_key = (c->cmd == PROTOCOL_BINARY_CMD_GETK ||
+                             c->cmd == PROTOCOL_BINARY_CMD_GATK);
+    int should_return_value = (c->cmd != PROTOCOL_BINARY_CMD_TOUCH);
 
     if (settings.verbose > 1) {
-        int ii;
-        /* May be GAT/GATQ/etc */
-        fprintf(stderr, "<%d TOUCH ", c->sfd);
-        for (ii = 0; ii < nkey; ++ii) {
-            fprintf(stderr, "%c", key[ii]);
-        }
-        fprintf(stderr, "\n");
+        fprintf(stderr, "<%d %s ", c->sfd, should_touch ? "TOUCH" : "GET");
+        fwrite(key, 1, nkey, stderr);
+        fputc('\n', stderr);
     }
 
-    it = item_touch(key, nkey, realtime(exptime));
+    if (should_touch) {
+        protocol_binary_request_touch *t = binary_get_request(c);
+        time_t exptime = ntohl(t->message.body.expiration);
+
+        it = item_touch(key, nkey, realtime(exptime));
+    } else {
+        it = item_get(key, nkey);
+    }
 
     if (it) {
         /* the length has two unnecessary bytes ("\r\n") */
@@ -1219,16 +1233,26 @@ static void process_bin_touch(conn *c) {
 
         item_update(it);
         pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.touch_cmds++;
-        c->thread->stats.slab_stats[it->slabs_clsid].touch_hits++;
+        if (should_touch) {
+            c->thread->stats.touch_cmds++;
+            c->thread->stats.slab_stats[it->slabs_clsid].touch_hits++;
+        } else {
+            c->thread->stats.get_cmds++;
+            c->thread->stats.slab_stats[it->slabs_clsid].get_hits++;
+        }
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        MEMCACHED_COMMAND_TOUCH(c->sfd, ITEM_key(it), it->nkey,
-                                it->nbytes, ITEM_get_cas(it));
+        if (should_touch) {
+            MEMCACHED_COMMAND_TOUCH(c->sfd, ITEM_key(it), it->nkey,
+                                    it->nbytes, ITEM_get_cas(it));
+        } else {
+            MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
+                                  it->nbytes, ITEM_get_cas(it));
+        }
 
         if (c->cmd == PROTOCOL_BINARY_CMD_TOUCH) {
             bodylen -= it->nbytes - 2;
-        } else if (c->cmd == PROTOCOL_BINARY_CMD_GATK) {
+        } else if (should_return_key) {
             bodylen += nkey;
             keylen = nkey;
         }
@@ -1240,12 +1264,12 @@ static void process_bin_touch(conn *c) {
         rsp->message.body.flags = htonl(strtoul(ITEM_suffix(it), NULL, 10));
         add_iov(c, &rsp->message.body, sizeof(rsp->message.body));
 
-        if (c->cmd == PROTOCOL_BINARY_CMD_GATK) {
+        if (should_return_key) {
             add_iov(c, ITEM_key(it), nkey);
         }
 
-        /* Add the data minus the CRLF */
-        if (c->cmd != PROTOCOL_BINARY_CMD_TOUCH) {
+        if (should_return_value) {
+            /* Add the data minus the CRLF */
             add_iov(c, ITEM_data(it), it->nbytes - 2);
         }
 
@@ -1255,98 +1279,25 @@ static void process_bin_touch(conn *c) {
         c->item = it;
     } else {
         pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.touch_cmds++;
-        c->thread->stats.touch_misses++;
+        if (should_touch) {
+            c->thread->stats.touch_cmds++;
+            c->thread->stats.touch_misses++;
+        } else {
+            c->thread->stats.get_cmds++;
+            c->thread->stats.get_misses++;
+        }
         pthread_mutex_unlock(&c->thread->stats.mutex);
 
-        MEMCACHED_COMMAND_TOUCH(c->sfd, key, nkey, -1, 0);
+        if (should_touch) {
+            MEMCACHED_COMMAND_TOUCH(c->sfd, key, nkey, -1, 0);
+        } else {
+            MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
+        }
 
         if (c->noreply) {
             conn_set_state(c, conn_new_cmd);
         } else {
-            if (c->cmd == PROTOCOL_BINARY_CMD_GATK) {
-                char *ofs = c->wbuf + sizeof(protocol_binary_response_header);
-                add_bin_header(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT,
-                        0, nkey, nkey);
-                memcpy(ofs, key, nkey);
-                add_iov(c, ofs, nkey);
-                conn_set_state(c, conn_mwrite);
-                c->write_and_go = conn_new_cmd;
-            } else {
-                write_bin_error(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT, 0);
-            }
-        }
-    }
-
-    if (settings.detail_enabled) {
-        stats_prefix_record_get(key, nkey, NULL != it);
-    }
-}
-
-static void process_bin_get(conn *c) {
-    item *it;
-
-    protocol_binary_response_get* rsp = (protocol_binary_response_get*)c->wbuf;
-    char* key = binary_get_key(c);
-    size_t nkey = c->binary_header.request.keylen;
-
-    if (settings.verbose > 1) {
-        int ii;
-        fprintf(stderr, "<%d GET ", c->sfd);
-        for (ii = 0; ii < nkey; ++ii) {
-            fprintf(stderr, "%c", key[ii]);
-        }
-        fprintf(stderr, "\n");
-    }
-
-    it = item_get(key, nkey);
-    if (it) {
-        /* the length has two unnecessary bytes ("\r\n") */
-        uint16_t keylen = 0;
-        uint32_t bodylen = sizeof(rsp->message.body) + (it->nbytes - 2);
-
-        item_update(it);
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.get_cmds++;
-        c->thread->stats.slab_stats[it->slabs_clsid].get_hits++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-
-        MEMCACHED_COMMAND_GET(c->sfd, ITEM_key(it), it->nkey,
-                              it->nbytes, ITEM_get_cas(it));
-
-        if (c->cmd == PROTOCOL_BINARY_CMD_GETK) {
-            bodylen += nkey;
-            keylen = nkey;
-        }
-        add_bin_header(c, 0, sizeof(rsp->message.body), keylen, bodylen);
-        rsp->message.header.response.cas = htonll(ITEM_get_cas(it));
-
-        // add the flags
-        rsp->message.body.flags = htonl(strtoul(ITEM_suffix(it), NULL, 10));
-        add_iov(c, &rsp->message.body, sizeof(rsp->message.body));
-
-        if (c->cmd == PROTOCOL_BINARY_CMD_GETK) {
-            add_iov(c, ITEM_key(it), nkey);
-        }
-
-        /* Add the data minus the CRLF */
-        add_iov(c, ITEM_data(it), it->nbytes - 2);
-        conn_set_state(c, conn_mwrite);
-        c->write_and_go = conn_new_cmd;
-        /* Remember this command so we can garbage collect it later */
-        c->item = it;
-    } else {
-        pthread_mutex_lock(&c->thread->stats.mutex);
-        c->thread->stats.get_cmds++;
-        c->thread->stats.get_misses++;
-        pthread_mutex_unlock(&c->thread->stats.mutex);
-
-        MEMCACHED_COMMAND_GET(c->sfd, key, nkey, -1, 0);
-
-        if (c->noreply) {
-            conn_set_state(c, conn_new_cmd);
-        } else {
-            if (c->cmd == PROTOCOL_BINARY_CMD_GETK) {
+            if (should_return_key) {
                 char *ofs = c->wbuf + sizeof(protocol_binary_response_header);
                 add_bin_header(c, PROTOCOL_BINARY_RESPONSE_KEY_ENOENT,
                         0, nkey, nkey);
@@ -1602,6 +1553,8 @@ static void init_sasl_conn(conn *c) {
     if (!settings.sasl)
         return;
 
+    c->authenticated = false;
+
     if (!c->sasl_conn) {
         int result=sasl_server_new("memcached",
                                    NULL,
@@ -1736,6 +1689,7 @@ static void process_bin_complete_sasl_auth(conn *c) {
 
     switch(result) {
     case SASL_OK:
+        c->authenticated = true;
         write_bin_response(c, "Authenticated", 0, 0, strlen("Authenticated"));
         pthread_mutex_lock(&c->thread->stats.mutex);
         c->thread->stats.auth_cmds++;
@@ -1772,11 +1726,7 @@ static bool authenticated(conn *c) {
         rv = true;
         break;
     default:
-        if (c->sasl_conn) {
-            const void *uname = NULL;
-            sasl_getprop(c->sasl_conn, SASL_USERNAME, &uname);
-            rv = uname != NULL;
-        }
+        rv = c->authenticated;
     }
 
     if (settings.verbose > 1) {
@@ -2149,7 +2099,12 @@ static void process_bin_delete(conn *c) {
     assert(c != NULL);
 
     if (settings.verbose > 1) {
-        fprintf(stderr, "Deleting %s\n", key);
+        int ii;
+        fprintf(stderr, "Deleting ");
+        for (ii = 0; ii < nkey; ++ii) {
+            fprintf(stderr, "%c", key[ii]);
+        }
+        fprintf(stderr, "\n");
     }
 
     if (settings.detail_enabled) {
@@ -2195,10 +2150,8 @@ static void complete_nread_binary(conn *c) {
         complete_update_bin(c);
         break;
     case bin_reading_get_key:
-        process_bin_get(c);
-        break;
     case bin_reading_touch_key:
-        process_bin_touch(c);
+        process_bin_get_or_touch(c);
         break;
     case bin_reading_stat:
         process_bin_stat(c);
@@ -2594,7 +2547,7 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
 
 static void process_stat_settings(ADD_STAT add_stats, void *c) {
     assert(add_stats);
-    APPEND_STAT("maxbytes", "%u", (unsigned int)settings.maxbytes);
+    APPEND_STAT("maxbytes", "%llu", (unsigned long long)settings.maxbytes);
     APPEND_STAT("maxconns", "%d", settings.maxconns);
     APPEND_STAT("tcpport", "%d", settings.port);
     APPEND_STAT("udpport", "%d", settings.udpport);
@@ -2719,6 +2672,9 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
 
             if(nkey > KEY_MAX_LENGTH) {
                 out_string(c, "CLIENT_ERROR bad command line format");
+                while (i-- > 0) {
+                    item_remove(*(c->ilist + i));
+                }
                 return;
             }
 
@@ -2767,6 +2723,9 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                   if (suffix == NULL) {
                     out_string(c, "SERVER_ERROR out of memory making CAS suffix");
                     item_remove(it);
+                    while (i-- > 0) {
+                        item_remove(*(c->ilist + i));
+                    }
                     return;
                   }
                   *(c->suffixlist + i) = suffix;
@@ -2797,8 +2756,14 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
                 }
 
 
-                if (settings.verbose > 1)
-                    fprintf(stderr, ">%d sending key %s\n", c->sfd, ITEM_key(it));
+                if (settings.verbose > 1) {
+                    int ii;
+                    fprintf(stderr, ">%d sending key ", c->sfd);
+                    for (ii = 0; ii < it->nkey; ++ii) {
+                        fprintf(stderr, "%c", key[ii]);
+                    }
+                    fprintf(stderr, "\n");
+                }
 
                 /* item_get() has incremented it->refcount for us */
                 pthread_mutex_lock(&c->thread->stats.mutex);
@@ -2854,8 +2819,6 @@ static inline void process_get_command(conn *c, token_t *tokens, size_t ntokens,
         conn_set_state(c, conn_mwrite);
         c->msgcurr = 0;
     }
-
-    return;
 }
 
 static void process_update_command(conn *c, token_t *tokens, const size_t ntokens, int comm, bool handle_cas) {
@@ -3097,7 +3060,20 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
 
     snprintf(buf, INCR_MAX_STORAGE_LEN, "%llu", (unsigned long long)value);
     res = strlen(buf);
-    if (res + 2 > it->nbytes || it->refcount != 1) { /* need to realloc */
+    /* refcount == 2 means we are the only ones holding the item, and it is
+     * linked. We hold the item's lock in this function, so refcount cannot
+     * increase. */
+    if (res + 2 <= it->nbytes && it->refcount == 2) { /* replace in-place */
+        /* When changing the value without replacing the item, we
+           need to update the CAS on the existing item. */
+        mutex_lock(&cache_lock); /* FIXME */
+        ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
+        mutex_unlock(&cache_lock);
+
+        memcpy(ITEM_data(it), buf, res);
+        memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
+        do_item_update(it);
+    } else if (it->refcount > 1) {
         item *new_it;
         new_it = do_item_alloc(ITEM_key(it), it->nkey, atoi(ITEM_suffix(it) + 1), it->exptime, res + 2, hv);
         if (new_it == 0) {
@@ -3111,16 +3087,15 @@ enum delta_result_type do_add_delta(conn *c, const char *key, const size_t nkey,
         // returning the CAS of the old item below.
         ITEM_set_cas(it, (settings.use_cas) ? ITEM_get_cas(new_it) : 0);
         do_item_remove(new_it);       /* release our reference */
-    } else { /* replace in-place */
-        /* When changing the value without replacing the item, we
-           need to update the CAS on the existing item. */
-        mutex_lock(&cache_lock); /* FIXME */
-        ITEM_set_cas(it, (settings.use_cas) ? get_cas_id() : 0);
-        mutex_unlock(&cache_lock);
-
-        memcpy(ITEM_data(it), buf, res);
-        memset(ITEM_data(it) + res, ' ', it->nbytes - res - 2);
-        do_item_update(it);
+    } else {
+        /* Should never get here. This means we somehow fetched an unlinked
+         * item. TODO: Add a counter? */
+        if (settings.verbose) {
+            fprintf(stderr, "Tried to do incr/decr on invalid item\n");
+        }
+        if (it->refcount == 1)
+            do_item_remove(it);
+        return DELTA_ITEM_NOT_FOUND;
     }
 
     if (cas) {
@@ -3522,7 +3497,8 @@ static enum try_read_result try_read_udp(conn *c) {
 
     c->request_addr_size = sizeof(c->request_addr);
     res = recvfrom(c->sfd, c->rbuf, c->rsize,
-                   0, &c->request_addr, &c->request_addr_size);
+                   0, (struct sockaddr *)&c->request_addr,
+                   &c->request_addr_size);
     if (res > 8) {
         unsigned char *buf = (unsigned char *)c->rbuf;
         pthread_mutex_lock(&c->thread->stats.mutex);
@@ -3737,12 +3713,17 @@ static enum transmit_result transmit(conn *c) {
 
 static void drive_machine(conn *c) {
     bool stop = false;
-    int sfd, flags = 1;
+    int sfd;
     socklen_t addrlen;
     struct sockaddr_storage addr;
     int nreqs = settings.reqs_per_event;
     int res;
     const char *str;
+#ifdef HAVE_ACCEPT4
+    static int  use_accept4 = 1;
+#else
+    static int  use_accept4 = 0;
+#endif
 
     assert(c != NULL);
 
@@ -3751,7 +3732,21 @@ static void drive_machine(conn *c) {
         switch(c->state) {
         case conn_listening:
             addrlen = sizeof(addr);
-            if ((sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen)) == -1) {
+#ifdef HAVE_ACCEPT4
+            if (use_accept4) {
+                sfd = accept4(c->sfd, (struct sockaddr *)&addr, &addrlen, SOCK_NONBLOCK);
+            } else {
+                sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+            }
+#else
+            sfd = accept(c->sfd, (struct sockaddr *)&addr, &addrlen);
+#endif
+            if (sfd == -1) {
+                if (use_accept4 && errno == ENOSYS) {
+                    use_accept4 = 0;
+                    continue;
+                }
+                perror(use_accept4 ? "accept4()" : "accept()");
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     /* these are transient, so don't log anything */
                     stop = true;
@@ -3766,11 +3761,12 @@ static void drive_machine(conn *c) {
                 }
                 break;
             }
-            if ((flags = fcntl(sfd, F_GETFL, 0)) < 0 ||
-                fcntl(sfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-                perror("setting O_NONBLOCK");
-                close(sfd);
-                break;
+            if (!use_accept4) {
+                if (fcntl(sfd, F_SETFL, fcntl(sfd, F_GETFL) | O_NONBLOCK) < 0) {
+                    perror("setting O_NONBLOCK");
+                    close(sfd);
+                    break;
+                }
             }
 
             if (settings.maxconns_fast &&
@@ -3850,6 +3846,7 @@ static void drive_machine(conn *c) {
                         if (settings.verbose > 0)
                             fprintf(stderr, "Couldn't update event\n");
                         conn_set_state(c, conn_closing);
+                        break;
                     }
                 }
                 stop = true;
@@ -3861,6 +3858,16 @@ static void drive_machine(conn *c) {
                 complete_nread(c);
                 break;
             }
+
+            /* Check if rbytes < 0, to prevent crash */
+            if (c->rlbytes < 0) {
+                if (settings.verbose) {
+                    fprintf(stderr, "Invalid rlbytes to read: len %d\n", c->rlbytes);
+                }
+                conn_set_state(c, conn_closing);
+                break;
+            }
+
             /* first check if we have leftovers in the conn_read buffer */
             if (c->rbytes > 0) {
                 int tocopy = c->rbytes > c->rlbytes ? c->rlbytes : c->rbytes;
